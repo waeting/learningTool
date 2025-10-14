@@ -63,7 +63,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 def click_periodically(
     driver: webdriver.Chrome,
     window_handle: str,
-    interval_seconds: int = 90,
+    interval_seconds: int = 30,
 ) -> None:
     """Periodically toggles between the "通過標準" and "課程簡介" tabs.
 
@@ -141,6 +141,92 @@ def click_periodically(
             intro_active_now = 'mat-tab-label-active' in intro_elem_current.get_attribute('class').split()
             if pass_active_now and not intro_active_now:
                 print(f"[ClickLoop] 現在停在：通過標準 (Window {window_handle})")
+                # Extract reading time progress when on "通過標準" tab
+                try:
+                    # Look for reading time progress info with multiple fallback strategies
+                    progress_elements = []
+                    
+                    # Strategy 1: Find the specific "閱讀時數" progress block
+                    progress_elements = driver.find_elements(
+                        By.XPATH,
+                        "//div[contains(@class, 'course-status__progress')]//span[contains(@class, 'course-status__progress-label') and contains(text(), '閱讀時數')]/following-sibling::*//div[contains(@class, 'course-status__progress-info')]"
+                    )
+                    
+                    # Strategy 2: More direct approach - find the parent div containing "閱讀時數" label
+                    if not progress_elements:
+                        reading_blocks = driver.find_elements(
+                            By.XPATH,
+                            "//div[contains(@class, 'course-status__progress')]//span[contains(text(), '閱讀時數')]"
+                        )
+                        for block in reading_blocks:
+                            # Look for the progress-info div in the same parent container
+                            parent_progress = block.find_element(By.XPATH, "ancestor::div[contains(@class, 'course-status__progress')][1]")
+                            info_divs = parent_progress.find_elements(By.XPATH, ".//div[contains(@class, 'course-status__progress-info')]")
+                            if info_divs:
+                                progress_elements = info_divs
+                                break
+                    
+                    # Strategy 3: Find by the structure - div containing both label and info
+                    if not progress_elements:
+                        progress_elements = driver.find_elements(
+                            By.XPATH,
+                            "//div[contains(@class, 'course-status__progress') and .//span[contains(text(), '閱讀時數')]]//div[contains(@class, 'course-status__progress-info')]"
+                        )
+                    if progress_elements:
+                        progress_info = progress_elements[0]
+                        print(f"[ClickLoop] 找到進度元素，使用策略成功 (Window {window_handle})")
+                        
+                        # Extract minutes and percentage from the reading time progress
+                        minutes_elem = progress_info.find_elements(By.XPATH, ".//span[contains(text(), '分鐘')]")
+                        percentage_elem = progress_info.find_elements(By.XPATH, ".//small[contains(text(), '%')]")
+                        
+                        # Debug: show what we found
+                        print(f"[ClickLoop] 進度區塊內容: '{progress_info.text.strip()}' (Window {window_handle})")
+                        
+                        # Fallback strategies for text extraction
+                        if not minutes_elem:
+                            minutes_elem = progress_info.find_elements(By.XPATH, ".//*[contains(text(), '分鐘')]")
+                        if not percentage_elem:
+                            percentage_elem = progress_info.find_elements(By.XPATH, ".//*[contains(text(), '%')]")
+                        
+                        if minutes_elem and percentage_elem:
+                            minutes_text = minutes_elem[0].text.strip()
+                            percentage_text = percentage_elem[0].text.strip()
+                            print(f"[ClickLoop] 閱讀時數進度：{minutes_text} {percentage_text} (Window {window_handle})")
+                            
+                            # Check if 100% completed AND minutes divisible by 5
+                            if "(100%)" in percentage_text or "100%" in percentage_text:
+                                # Extract the number of minutes
+                                import re
+                                minutes_match = re.search(r'(\d+)', minutes_text)
+                                if minutes_match:
+                                    minutes_number = int(minutes_match.group(1))
+                                    if minutes_number % 5 == 0:
+                                        print(f"[ClickLoop] 課程已達到100%且分鐘數({minutes_number})可被5整除，關閉分頁 (Window {window_handle})")
+                                        try:
+                                            driver.close()
+                                            return  # Exit the function to stop tracking this course
+                                        except Exception as close_err:
+                                            print(f"[ClickLoop] Failed to close window {window_handle}: {close_err}")
+                                    else:
+                                        print(f"[ClickLoop] 課程已達到100%但分鐘數({minutes_number})不可被5整除，繼續追蹤 (Window {window_handle})")
+                                else:
+                                    print(f"[ClickLoop] 課程已達到100%但無法解析分鐘數，繼續追蹤 (Window {window_handle})")
+                        else:
+                            print(f"[ClickLoop] 找到進度元素但無法解析分鐘數或百分比 (Window {window_handle})")
+                            print(f"[ClickLoop] 進度元素內容: {progress_info.text} (Window {window_handle})")
+                    else:
+                        print(f"[ClickLoop] 所有策略都未找到閱讀時數進度元素 (Window {window_handle})")
+                        # Debug: print all elements that might be related
+                        all_progress = driver.find_elements(By.XPATH, "//*[contains(@class, 'progress') or contains(text(), '閱讀') or contains(text(), '分鐘')]")
+                        if all_progress:
+                            print(f"[ClickLoop] 找到 {len(all_progress)} 個可能相關的元素 (Window {window_handle})")
+                            for i, elem in enumerate(all_progress[:3]):  # Only show first 3
+                                print(f"[ClickLoop] 元素 {i+1}: {elem.tag_name} - {elem.text[:50]} (Window {window_handle})")
+                        else:
+                            print(f"[ClickLoop] 頁面上沒有找到任何相關元素 (Window {window_handle})")
+                except Exception as progress_err:
+                    print(f"[ClickLoop] 抓取閱讀時數進度時發生錯誤 (Window {window_handle}): {progress_err}")
             elif intro_active_now and not pass_active_now:
                 print(f"[ClickLoop] 現在停在：課程簡介 (Window {window_handle})")
             else:
