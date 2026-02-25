@@ -428,37 +428,80 @@ def auto_fill_oauth_form(driver: webdriver.Chrome, wait: WebDriverWait,
     return True
 
 
+def _find_captcha_img(driver: webdriver.Chrome):
+    """Return the CAPTCHA <img> element, or None if not found."""
+    for by, sel in [
+        (By.ID, "id2b"),  # Confirmed id from DOM inspection
+        (By.XPATH, "//img[contains(translate(@src,'CAPTCHA','captcha'),'captcha')]"),
+        (By.XPATH, "//img[contains(@src,'CheckCode') or contains(@src,'validcode')]"),
+        (By.XPATH, "//img[contains(translate(@src,'CAPTCHA','captcha'),'verify')]"),
+    ]:
+        try:
+            return driver.find_element(by, sel)
+        except Exception:
+            continue
+    return None
+
+
 def extract_captcha_and_prompt(driver: webdriver.Chrome) -> str:
     """Find the CAPTCHA image, save it to debug/captcha.png, open it for the
     user, then return the CAPTCHA string typed by the user in the terminal.
 
-    If no CAPTCHA image is found, skips the save/open step and just prompts.
+    If the user enters 'r' (or writes 'r' to the trigger file), the function
+    clicks the '換下一個' button on the login page, waits for the CAPTCHA
+    image to refresh, and prompts again.  This loop repeats until the user
+    provides a non-'r' value.
     """
     os.makedirs("debug", exist_ok=True)
-    captcha_img = None
-    for by, sel in [
-        (By.XPATH, "//img[contains(translate(@src,'CAPTCHA','captcha'),'captcha')]"),
-        (By.XPATH, "//img[contains(translate(@id,'CAPTCHA','captcha'),'captcha') or contains(translate(@class,'CAPTCHA','captcha'),'captcha')]"),
-        (By.XPATH, "//img[contains(translate(@src,'CAPTCHA','captcha'),'verify') or contains(translate(@src,'CAPTCHA','captcha'),'code')]"),
-        (By.XPATH, "//img[contains(@src,'/captcha') or contains(@src,'CheckCode') or contains(@src,'validcode')]"),
-    ]:
+
+    while True:
+        captcha_img = _find_captcha_img(driver)
+        if captcha_img:
+            try:
+                captcha_img.screenshot('debug/captcha.png')
+                log("[Login] CAPTCHA 圖片已儲存至 debug/captcha.png，正在開啟預覽…")
+                subprocess.Popen(['open', 'debug/captcha.png'])
+            except Exception as e:
+                log(f"[Login] 儲存 CAPTCHA 圖片失敗：{e}")
+        else:
+            log("[Login] 未找到 CAPTCHA 圖片，請直接查看瀏覽器。")
+
+        log("[Login] 輸入驗證碼，或輸入 r 換一張：")
+        value = _prompt_or_file("[Login] 驗證碼（r=換一張）：", "debug/captcha_input.txt")
+
+        if value.strip().lower() != 'r':
+            return value.strip()
+
+        # User wants a new CAPTCHA — click '換下一個'
+        log("[Login] 正在切換下一張 CAPTCHA…")
+        old_src = captcha_img.get_attribute('src') if captcha_img else None
         try:
-            captcha_img = driver.find_element(by, sel)
-            break
+            refresh_btn = driver.find_element(By.ID, "id12")
+            refresh_btn.click()
         except Exception:
-            continue
+            try:
+                refresh_btn = driver.find_element(
+                    By.XPATH, "//a[normalize-space(.)='換下一個' or @title='換下一個']"
+                )
+                refresh_btn.click()
+            except Exception as e:
+                log(f"[Login] 找不到換下一個按鈕：{e}")
+                continue
 
-    if captcha_img:
-        try:
-            captcha_img.screenshot('debug/captcha.png')
-            log("[Login] CAPTCHA 圖片已儲存至 debug/captcha.png，正在開啟預覽…")
-            subprocess.Popen(['open', 'debug/captcha.png'])
-        except Exception as e:
-            log(f"[Login] 儲存 CAPTCHA 圖片失敗：{e}")
-    else:
-        log("[Login] 未找到 CAPTCHA 圖片，請直接查看瀏覽器。")
-
-    return _prompt_or_file("[Login] 請輸入驗證碼（CAPTCHA）：", "debug/captcha_input.txt")
+        # Wait for the img src to change (antiCache param updates)
+        if old_src:
+            try:
+                WebDriverWait(driver, 5).until(
+                    lambda d: (
+                        _find_captcha_img(d) is not None
+                        and _find_captcha_img(d).get_attribute('src') != old_src
+                    )
+                )
+            except Exception:
+                time.sleep(1)
+        else:
+            time.sleep(1)
+        log("[Login] CAPTCHA 已刷新。")
 
 
 def fill_captcha_and_submit(driver: webdriver.Chrome, captcha_value: str) -> bool:
@@ -560,6 +603,11 @@ def transfer_to_headless_via_profile(user_data_dir: str) -> webdriver.Chrome:
 # Core automation
 # ---------------------------------------------------------------------------
 
+# Track the minute count at which each course first reached 100%.
+# Key: course_id  Value: minute count when 100% was first seen
+_first_100_pct_minutes: dict = {}
+
+
 def _debug_progress_elements(driver: webdriver.Chrome, course_id: str) -> None:
     """Log debug information about progress-related elements on the current page."""
     all_progress = driver.find_elements(
@@ -637,6 +685,9 @@ def _check_reading_progress(driver: webdriver.Chrome, course_id: str) -> bool:
         log(f"[Loop] 閱讀時數進度：{minutes_text} {percentage_text} ({course_id})")
 
         if "(100%)" not in percentage_text and "100%" not in percentage_text:
+            # Not yet complete — reset any stored first-seen record so that
+            # if a course somehow goes back below 100% we start fresh.
+            _first_100_pct_minutes.pop(course_id, None)
             return False
 
         minutes_match = re.search(r'(\d+)', minutes_text)
@@ -645,10 +696,21 @@ def _check_reading_progress(driver: webdriver.Chrome, course_id: str) -> bool:
             return False
 
         minutes_number = int(minutes_match.group(1))
-        if minutes_number % 5 == 0:
-            log(f"[Loop] 課程已達到100%且分鐘數({minutes_number})可被5整除，關閉分頁 ({course_id})")
+
+        if course_id not in _first_100_pct_minutes:
+            # First time we see 100% — record the minute count and wait for
+            # the platform to tick up at least one more minute to confirm
+            # that the required total has genuinely been reached.
+            _first_100_pct_minutes[course_id] = minutes_number
+            log(f"[Loop] 初見100%（{minutes_number}分鐘），等下一輪確認分鐘數增加 ({course_id})")
+            return False
+
+        first_minutes = _first_100_pct_minutes[course_id]
+        if minutes_number > first_minutes:
+            log(f"[Loop] 確認完成：100% 且分鐘數已從 {first_minutes} 增至 {minutes_number}，關閉分頁 ({course_id})")
             return True
-        log(f"[Loop] 課程已達到100%但分鐘數({minutes_number})不可被5整除，繼續追蹤 ({course_id})")
+
+        log(f"[Loop] 100% 但分鐘數({minutes_number})尚未超過初見值({first_minutes})，繼續等待 ({course_id})")
         return False
 
     except Exception as e:
@@ -815,21 +877,34 @@ def open_in_progress_courses_mod(driver: webdriver.Chrome, child_headless: bool 
         log("[Navigate] 課程列表已載入。")
     except Exception:
         log("[Navigate] 等待課程列表逾時，繼續執行…")
-    time.sleep(2)  # Extra buffer for Angular rendering
+    time.sleep(1)  # Extra buffer for Angular rendering
+
+    # Apply the "進行中" filter via the Angular Material mat-select dropdown.
+    # The filter select has id="mat-select-0" and currently shows "不限".
+    # After clicking it, options appear in the CDK overlay as <mat-option> elements.
+    try:
+        filter_select = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.ID, "mat-select-0"))
+        )
+        filter_select.click()
+        # Wait for the overlay options to appear
+        in_progress_option = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((
+                By.XPATH,
+                "//mat-option[contains(normalize-space(.),'進行中')]",
+            ))
+        )
+        in_progress_option.click()
+        log("[Navigate] 已套用「進行中」篩選。")
+        # Wait for the filtered list to render
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, "//tr[contains(@class, 'table__accordion-head')]"))
+        )
+        time.sleep(1)
+    except Exception as e:
+        log(f"[Navigate] 無法套用篩選（繼續使用全部課程）：{e}")
+
     parent_handle = driver.current_window_handle
-    # Save a screenshot and page source for debugging
-    os.makedirs("debug", exist_ok=True)
-    try:
-        driver.save_screenshot("debug/my_learning_page.png")
-        log("[Navigate] 截圖已儲存至 debug/my_learning_page.png")
-    except Exception:
-        pass
-    try:
-        with open("debug/my_learning_page.html", "w", encoding="utf-8") as _f:
-            _f.write(driver.page_source)
-        log("[Navigate] 頁面 HTML 已儲存至 debug/my_learning_page.html")
-    except Exception:
-        pass
     # We'll return a list of (driver, handle) pairs.  If child_headless is False,
     # the driver will always be the main driver; otherwise a new headless driver
     # will be spawned for each course and added here.
@@ -1080,15 +1155,19 @@ def main() -> None:
     # Ensure Traditional Chinese UI before prompting login
     ensure_chinese_language(driver)
 
-    # Wait for the page to fully stabilise after language switch.
-    # Angular re-renders the whole app when the locale changes; clicking
-    # the Login button too soon causes the dialog to open and then get
-    # dismissed when the re-render completes.
-    time.sleep(5)
-
-    # Auto-click Login button and select the login method
+    # Retry loop: try clicking Login and selecting the method.  Angular
+    # re-renders after the language switch, which can dismiss the dialog if
+    # we click too early.  We sleep 1 second, try, and retry up to
+    # _MAX_LOGIN_ATTEMPTS times rather than using a fixed long sleep.
+    _MAX_LOGIN_ATTEMPTS = 6
     login_wait = WebDriverWait(driver, 10)
-    start_login(driver, login_wait, method=login_method)
+    for _attempt in range(_MAX_LOGIN_ATTEMPTS):
+        time.sleep(1)
+        if start_login(driver, login_wait, method=login_method):
+            break
+        log(f"[Main] 登入對話框未成功開啟，重試（{_attempt + 1}/{_MAX_LOGIN_ATTEMPTS}）…")
+    else:
+        log("[Main] 警告：已達登入重試上限，嘗試繼續執行。")
 
     # If credentials are provided in config.json, auto-fill the OAuth form
     if username and password:
