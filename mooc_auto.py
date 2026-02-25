@@ -488,7 +488,7 @@ def extract_captcha_and_prompt(driver: webdriver.Chrome) -> str:
                 log(f"[Login] 找不到換下一個按鈕：{e}")
                 continue
 
-        # Wait for the img src to change (antiCache param updates)
+        # Step 1: wait for the img src to change (antiCache param updates)
         if old_src:
             try:
                 WebDriverWait(driver, 5).until(
@@ -501,6 +501,20 @@ def extract_captcha_and_prompt(driver: webdriver.Chrome) -> str:
                 time.sleep(1)
         else:
             time.sleep(1)
+
+        # Step 2: wait for the new image to finish loading (naturalWidth > 0)
+        new_img = _find_captcha_img(driver)
+        if new_img:
+            try:
+                WebDriverWait(driver, 5).until(
+                    lambda d: driver.execute_script(
+                        "var el = arguments[0];"
+                        "return el.complete && el.naturalWidth > 0;",
+                        new_img,
+                    )
+                )
+            except Exception:
+                time.sleep(1)  # fallback sleep if JS check fails
         log("[Login] CAPTCHA 已刷新。")
 
 
