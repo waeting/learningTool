@@ -51,7 +51,7 @@ script does **not** attempt to automate login; the user must log in
 manually when prompted.
 """
 
-import json
+import getpass
 import os
 import subprocess
 import sys
@@ -100,6 +100,34 @@ def _prompt_or_file(prompt: str, trigger_file: str) -> str:
     except Exception:
         value = ""
     log("已讀取輸入，繼續執行…")
+    return value
+
+
+def _prompt_password() -> str:
+    """Prompt for a password without echoing it to the terminal.
+
+    In interactive (TTY) mode, uses getpass.getpass() so the input is hidden.
+    In background (non-TTY) mode, falls back to the file-trigger pattern:
+    the user writes the password to debug/password_input.txt from another
+    terminal, and this function reads and immediately deletes that file.
+    """
+    if sys.stdin.isatty():
+        return getpass.getpass("[Login] 請輸入密碼（輸入不會顯示）：")
+    os.makedirs("debug", exist_ok=True)
+    trigger = "debug/password_input.txt"
+    log("════════════════════════════════════")
+    log("請在另一個終端機執行（輸入後檔案會立即刪除）：")
+    log(f"  echo '你的密碼' > {trigger}")
+    log("════════════════════════════════════")
+    while not os.path.exists(trigger):
+        time.sleep(1)
+    try:
+        with open(trigger, 'r', encoding='utf-8') as f:
+            value = f.read().strip()
+        os.remove(trigger)
+    except Exception:
+        value = ""
+    log("已讀取密碼，繼續執行…")
     return value
 
 
@@ -338,29 +366,6 @@ def click_user_avatar(driver: webdriver.Chrome, wait: WebDriverWait) -> bool:
             continue
     return False
 
-
-def load_config() -> dict:
-    """Load credentials and settings from config.json in the same directory.
-
-    Expected format::
-
-        {
-            "username": "your_edu_account",
-            "password": "your_password",
-            "login_method": "教育雲端"
-        }
-
-    Returns an empty dict if config.json does not exist.
-    """
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-    if not os.path.exists(config_path):
-        return {}
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        log(f"[Config] 讀取 config.json 失敗：{e}")
-        return {}
 
 
 def auto_fill_oauth_form(driver: webdriver.Chrome, wait: WebDriverWait,
@@ -1132,19 +1137,18 @@ def main() -> None:
         action="store_true",
         help="Open child course windows in headless mode while keeping the main driver visible."
     )
-    parser.add_argument(
-        "--login-method",
-        default="教育雲端",
-        choices=["教育雲端", "一般帳號", "TANetRoaming"],
-        help="Login method to select from the dialog (default: 教育雲端)."
-    )
     args = parser.parse_args()
 
-    # Load credentials from config.json (if present)
-    config = load_config()
-    username = config.get('username', '')
-    password = config.get('password', '')
-    login_method = config.get('login_method', args.login_method)
+    # Login method is fixed to 教育雲端.
+    login_method = "教育雲端"
+
+    # Prompt for credentials interactively before opening the browser.
+    # Username is shown as typed; password input is hidden via getpass.
+    if sys.stdin.isatty():
+        username = input("[Login] 請輸入帳號：").strip()
+    else:
+        username = _prompt_or_file("[Login] 請輸入帳號：", "debug/username_input.txt")
+    password = _prompt_password()
 
     # Build Chrome options.  When --headless is requested, Chrome runs headless
     # from the very start — no GUI→headless profile transfer is needed.
@@ -1183,20 +1187,15 @@ def main() -> None:
     else:
         log("[Main] 警告：已達登入重試上限，嘗試繼續執行。")
 
-    # If credentials are provided in config.json, auto-fill the OAuth form
-    if username and password:
-        log("[Main] 偵測到 config.json 中有帳號密碼，嘗試自動填入…")
-        auto_fill_oauth_form(driver, login_wait, username, password)
-        captcha_value = extract_captcha_and_prompt(driver)
-        if captcha_value:
-            fill_captcha_and_submit(driver, captcha_value)
-            log("[Main] 已送出登入表單，等待 OAuth 導回並載入…")
-            time.sleep(8)
-        else:
-            log("[Main] 未輸入驗證碼，請手動完成登入後通知腳本繼續。")
-            _prompt_or_file("[Main] 登入完成後按 Enter：", "debug/login_done.txt")
+    # Auto-fill credentials and handle CAPTCHA
+    auto_fill_oauth_form(driver, login_wait, username, password)
+    captcha_value = extract_captcha_and_prompt(driver)
+    if captcha_value:
+        fill_captcha_and_submit(driver, captcha_value)
+        log("[Main] 已送出登入表單，等待 OAuth 導回並載入…")
+        time.sleep(8)
     else:
-        log("[Main] 未設定 config.json，請在瀏覽器中手動完成登入（帳號、密碼、驗證碼）。")
+        log("[Main] 未輸入驗證碼，請手動完成登入後通知腳本繼續。")
         _prompt_or_file("[Main] 登入完成後按 Enter：", "debug/login_done.txt")
 
     # Verify that login actually succeeded
