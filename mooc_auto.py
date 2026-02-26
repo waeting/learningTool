@@ -799,8 +799,8 @@ def run_click_loop(
     This single-threaded sequential approach replaces the previous design
     that spawned one thread per window.  The old design caused race
     conditions when multiple threads shared the same driver instance
-    (non-child-headless mode): one thread would call switch_to.window()
-    while another was mid-operation, causing reads from the wrong window.
+    one thread would call switch_to.window() while another was mid-operation,
+    causing reads from the wrong window.
 
     Args:
         triples: List of (driver, window_handle, course_id).  Entries are
@@ -852,14 +852,11 @@ def run_click_loop(
     log("[Loop] 所有課程皆已完成或監控已停止。")
 
 
-def open_in_progress_courses_mod(driver: webdriver.Chrome, child_headless: bool = False) -> Tuple[List[Tuple[webdriver.Chrome, str]], List[str]]:
+def open_in_progress_courses_mod(driver: webdriver.Chrome) -> Tuple[List[Tuple[webdriver.Chrome, str]], List[str]]:
     """Navigate to the My Learning page and open all not-yet-passed courses.
 
     Args:
         driver: A Selenium WebDriver already logged into the MOOCs platform.
-        child_headless: If True, each course is opened in a separate headless
-            Chrome driver.  If False, each course is opened in a new window
-            of the main driver.
 
     Returns:
         A tuple containing (course_window_pairs, course_ids) where each pair
@@ -1047,61 +1044,22 @@ def open_in_progress_courses_mod(driver: webdriver.Chrome, child_headless: bool 
             continue
         seen_ids.add(course_id)
         course_ids.append(course_id)
-        # Depending on child_headless flag, open the course off-screen in the same
-        # driver (child_headless=True) or in a visible new window (child_headless=False).
-        # NOTE: A separate headless Chrome process cannot share the authenticated
-        # session from the main driver, so child_headless uses the same driver and
-        # merely moves the new window off-screen so the user won't see it.
-        if child_headless:
-            try:
-                driver.switch_to.new_window('window')
-                driver.get(course_url)
-                n_handle = driver.current_window_handle
-                # Move the window far off-screen so the user doesn't see it
-                driver.set_window_position(-2000, 0)
-                driver.set_window_size(1920, 1080)
-            except Exception:
-                try:
-                    driver.execute_script("window.open(arguments[0], '_blank');", course_url)
-                    n_handle = driver.window_handles[-1]
-                    driver.switch_to.window(n_handle)
-                    driver.set_window_position(-2000, 0)
-                    driver.set_window_size(1920, 1080)
-                except Exception:
-                    try:
-                        driver.switch_to.window(parent_handle)
-                        driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
-                        time.sleep(3)
-                    except Exception:
-                        time.sleep(3)
-                    continue
-            course_windows.append((driver, n_handle))
-            log(f"[Navigate] Opened course window {n_handle} for course ID {course_id} (課程名稱：{title}) off-screen.")
-            # Return to list page
-            try:
-                driver.switch_to.window(parent_handle)
-                driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
-                time.sleep(3)
-            except Exception:
-                time.sleep(3)
-            continue
-        else:
-            try:
-                driver.switch_to.new_window('window')
-                driver.get(course_url)
-                n_handle = driver.current_window_handle
-            except Exception:
-                driver.execute_script("window.open(arguments[0], '_blank');", course_url)
-                n_handle = driver.window_handles[-1]
-                driver.switch_to.window(n_handle)
-            course_windows.append((driver, n_handle))
-            log(f"[Navigate] Opened course window {n_handle} for course ID {course_id} (課程名稱：{title}).")
-            try:
-                driver.switch_to.window(parent_handle)
-                driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
-                time.sleep(3)
-            except Exception:
-                time.sleep(3)
+        try:
+            driver.switch_to.new_window('window')
+            driver.get(course_url)
+            n_handle = driver.current_window_handle
+        except Exception:
+            driver.execute_script("window.open(arguments[0], '_blank');", course_url)
+            n_handle = driver.window_handles[-1]
+            driver.switch_to.window(n_handle)
+        course_windows.append((driver, n_handle))
+        log(f"[Navigate] 已開啟課程視窗 {n_handle}，課程 ID {course_id}（{title}）。")
+        try:
+            driver.switch_to.window(parent_handle)
+            driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
+            time.sleep(3)
+        except Exception:
+            time.sleep(3)
     if not course_windows:
         log("[Navigate] 沒有找到標示為未完成的課程。")
     return course_windows, course_ids
@@ -1122,20 +1080,12 @@ def main() -> None:
         the GUI window is closed.  The headless driver then continues all
         remaining automation.
 
-    --child-headless flag semantics (unchanged):
-        The main driver remains in its current mode (GUI or headless).  Each
-        individual course window is opened in its own headless Chrome instance.
     """
     parser = argparse.ArgumentParser(description="Automate interactions with the MOE MOOCs platform")
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="After login, transfer session to a headless Chrome driver for the automation phase."
-    )
-    parser.add_argument(
-        "--child-headless",
-        action="store_true",
-        help="Open child course windows in headless mode while keeping the main driver visible."
+        help="Run Chrome in headless mode (no visible window) throughout the entire session."
     )
     args = parser.parse_args()
 
@@ -1205,10 +1155,7 @@ def main() -> None:
         return
     log("[Main] 登入確認成功。")
 
-    # Open in‑progress courses and capture their drivers/handles.  The
-    # child_headless flag determines whether each course is opened in
-    # its own headless driver or in a new window of the main driver.
-    course_pairs, course_ids = open_in_progress_courses_mod(driver, child_headless=args.child_headless)
+    course_pairs, course_ids = open_in_progress_courses_mod(driver)
     if not course_pairs:
         log("[Main] 沒有找到未完成課程，或是打開課程時發生錯誤。請確認您已登入且有未完成課程。")
         return
@@ -1224,9 +1171,8 @@ def main() -> None:
     drivers_to_close: set = {driver}
     drivers_to_close.update(drv for drv, _, _ in triples)
 
-    # A single sequential monitoring loop replaces the previous per-window
-    # threads.  This prevents race conditions when multiple courses share the
-    # same driver instance (non-child-headless mode).
+    # A single sequential monitoring loop prevents race conditions when
+    # multiple courses share the same driver instance.
     stop_event = threading.Event()
     monitor_thread = threading.Thread(
         target=run_click_loop,
