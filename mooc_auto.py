@@ -1089,70 +1089,86 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Login method is fixed to 教育雲端.
     login_method = "教育雲端"
 
-    # Prompt for credentials interactively before opening the browser.
-    # Username is shown as typed; password input is hidden via getpass.
-    if sys.stdin.isatty():
-        username = input("[Login] 請輸入帳號：").strip()
-    else:
-        username = _prompt_or_file("[Login] 請輸入帳號：", "debug/username_input.txt")
-    password = _prompt_password()
-
-    # Build Chrome options.  When --headless is requested, Chrome runs headless
-    # from the very start — no GUI→headless profile transfer is needed.
-    # CAPTCHA is handled by saving the image to debug/captcha.png and opening
-    # it with the macOS "open" command, which works even in headless mode.
     options = webdriver.ChromeOptions()
     options.add_argument('--ignore-certificate-errors')
+
     if args.headless:
-        log("[Main] 以 headless 模式啟動 Chrome（全程 headless）。")
+        # ── Headless mode ────────────────────────────────────────────────────
+        # Prompt credentials before opening the browser so the user can paste
+        # them immediately.  CAPTCHA is extracted as an image file and opened
+        # in Preview; the user types the code back via terminal.
+        log("[Main] 以 headless 模式啟動 Chrome。")
+        if sys.stdin.isatty():
+            username = input("[Login] 請輸入帳號：").strip()
+        else:
+            username = _prompt_or_file("[Login] 請輸入帳號：", "debug/username_input.txt")
+        password = _prompt_password()
+
         options.add_argument('--headless=new')
         options.add_argument('--window-size=1920,1080')
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-gpu')
         options.add_argument('--disable-dev-shm-usage')
+        driver = webdriver.Chrome(options=options)
+        driver.get('https://moocs.moe.edu.tw/moocs/#/home')
+
+        ensure_chinese_language(driver)
+
+        _MAX_LOGIN_ATTEMPTS = 6
+        login_wait = WebDriverWait(driver, 10)
+        for _attempt in range(_MAX_LOGIN_ATTEMPTS):
+            time.sleep(1)
+            if start_login(driver, login_wait, method=login_method):
+                break
+            log(f"[Main] 登入對話框未成功開啟，重試（{_attempt + 1}/{_MAX_LOGIN_ATTEMPTS}）…")
+        else:
+            log("[Main] 警告：已達登入重試上限，嘗試繼續執行。")
+
+        auto_fill_oauth_form(driver, login_wait, username, password)
+        captcha_value = extract_captcha_and_prompt(driver)
+        if captcha_value:
+            fill_captcha_and_submit(driver, captcha_value)
+            log("[Main] 已送出登入表單，等待 OAuth 導回並載入…")
+            time.sleep(8)
+        else:
+            log("[Main] 未輸入驗證碼，請手動完成登入後通知腳本繼續。")
+            _prompt_or_file("[Main] 登入完成後按 Enter：", "debug/login_done.txt")
+
+        if not verify_login(driver, login_wait):
+            log("[Main] 未偵測到登入狀態，請確認已成功登入後重新執行。")
+            driver.quit()
+            return
+
     else:
+        # ── GUI mode ─────────────────────────────────────────────────────────
+        # Open a visible browser, navigate to the login page, and poll until
+        # the user completes login manually (no credential prompts, no CAPTCHA
+        # extraction — the user interacts directly with the browser).
         log("[Main] 以 GUI 模式啟動 Chrome。")
-    driver = webdriver.Chrome(options=options)
-    if not args.headless:
+        driver = webdriver.Chrome(options=options)
         driver.maximize_window()
-    driver.get('https://moocs.moe.edu.tw/moocs/#/home')
+        driver.get('https://moocs.moe.edu.tw/moocs/#/home')
 
-    # Ensure Traditional Chinese UI before prompting login
-    ensure_chinese_language(driver)
+        ensure_chinese_language(driver)
 
-    # Retry loop: try clicking Login and selecting the method.  Angular
-    # re-renders after the language switch, which can dismiss the dialog if
-    # we click too early.  We sleep 1 second, try, and retry up to
-    # _MAX_LOGIN_ATTEMPTS times rather than using a fixed long sleep.
-    _MAX_LOGIN_ATTEMPTS = 6
-    login_wait = WebDriverWait(driver, 10)
-    for _attempt in range(_MAX_LOGIN_ATTEMPTS):
-        time.sleep(1)
-        if start_login(driver, login_wait, method=login_method):
-            break
-        log(f"[Main] 登入對話框未成功開啟，重試（{_attempt + 1}/{_MAX_LOGIN_ATTEMPTS}）…")
-    else:
-        log("[Main] 警告：已達登入重試上限，嘗試繼續執行。")
+        _MAX_LOGIN_ATTEMPTS = 6
+        login_wait = WebDriverWait(driver, 10)
+        for _attempt in range(_MAX_LOGIN_ATTEMPTS):
+            time.sleep(1)
+            if start_login(driver, login_wait, method=login_method):
+                break
+            log(f"[Main] 登入對話框未成功開啟，重試（{_attempt + 1}/{_MAX_LOGIN_ATTEMPTS}）…")
+        else:
+            log("[Main] 警告：已達登入重試上限，請手動點擊登入按鈕。")
 
-    # Auto-fill credentials and handle CAPTCHA
-    auto_fill_oauth_form(driver, login_wait, username, password)
-    captcha_value = extract_captcha_and_prompt(driver)
-    if captcha_value:
-        fill_captcha_and_submit(driver, captcha_value)
-        log("[Main] 已送出登入表單，等待 OAuth 導回並載入…")
-        time.sleep(8)
-    else:
-        log("[Main] 未輸入驗證碼，請手動完成登入後通知腳本繼續。")
-        _prompt_or_file("[Main] 登入完成後按 Enter：", "debug/login_done.txt")
+        log("[Main] 請在瀏覽器中完成登入（帳號、密碼、驗證碼）…")
+        poll_wait = WebDriverWait(driver, 5)
+        while not verify_login(driver, poll_wait):
+            time.sleep(3)
+        login_wait = WebDriverWait(driver, 10)
 
-    # Verify that login actually succeeded
-    if not verify_login(driver, login_wait):
-        log("[Main] 未偵測到登入狀態，請確認已成功登入後重新執行。")
-        driver.quit()
-        return
     log("[Main] 登入確認成功。")
 
     course_pairs, course_ids = open_in_progress_courses_mod(driver)
