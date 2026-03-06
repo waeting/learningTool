@@ -816,6 +816,9 @@ def run_click_loop(
         stop_event = threading.Event()
 
     active: List[Tuple[webdriver.Chrome, str, str]] = list(triples)
+    # Track consecutive errors per course; remove only after MAX_ERRORS failures.
+    error_counts: dict = {}
+    MAX_ERRORS = 3
 
     while active and not stop_event.is_set():
         for entry in list(active):  # iterate over a snapshot so removal is safe
@@ -823,20 +826,34 @@ def run_click_loop(
                 break
             drv, handle, course_id = entry
 
-            # Verify the window is still open
+            # Verify the window is still open / switchable
             try:
                 drv.switch_to.window(handle)
             except Exception as e:
-                log(f"[Loop] 視窗 {handle} ({course_id}) 已關閉或不存在，移除追蹤：{e}")
-                active.remove(entry)
+                count = error_counts.get(course_id, 0) + 1
+                error_counts[course_id] = count
+                if count >= MAX_ERRORS:
+                    log(f"[Loop] 視窗 {course_id} 連續 {MAX_ERRORS} 次無法切換，放棄追蹤：{e}")
+                    active.remove(entry)
+                    error_counts.pop(course_id, None)
+                else:
+                    log(f"[Loop] 視窗 {course_id} 切換失敗（{count}/{MAX_ERRORS}），下輪重試：{e}")
                 continue
 
             # Toggle tabs and check for completion
             try:
                 done = _toggle_course_tabs(drv, handle, course_id)
+                error_counts.pop(course_id, None)  # reset on success
             except Exception as e:
-                log(f"[Loop] 處理課程 {course_id} 時發生錯誤：{e}")
+                count = error_counts.get(course_id, 0) + 1
+                error_counts[course_id] = count
+                log(f"[Loop] 處理課程 {course_id} 時發生錯誤（{count}/{MAX_ERRORS}）：{e}")
                 done = False
+                if count >= MAX_ERRORS:
+                    log(f"[Loop] 課程 {course_id} 連續 {MAX_ERRORS} 次錯誤，放棄追蹤。")
+                    active.remove(entry)
+                    error_counts.pop(course_id, None)
+                    continue
 
             if done:
                 try:
@@ -844,6 +861,7 @@ def run_click_loop(
                 except Exception:
                     pass
                 active.remove(entry)
+                error_counts.pop(course_id, None)
                 log(f"[Loop] 課程 {course_id} 已完成並關閉，剩餘 {len(active)} 門課程繼續追蹤。")
 
         if active and not stop_event.is_set():
