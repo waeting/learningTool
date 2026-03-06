@@ -64,6 +64,7 @@ from typing import List, Tuple
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -852,6 +853,145 @@ def run_click_loop(
     log("[Loop] 所有課程皆已完成或監控已停止。")
 
 
+def _is_row_unpassed(row) -> bool:
+    """Return True if the course row (or its sibling detail row) has the unpassed button."""
+    try:
+        if row.find_elements(By.XPATH, ".//button[contains(@class, 'ml-table__button--unpassed')]"):
+            return True
+    except Exception:
+        pass
+    try:
+        detail_row = row.find_element(By.XPATH, "following-sibling::tr[1]")
+        if detail_row.find_elements(By.XPATH, ".//button[contains(@class, 'ml-table__button--unpassed')]"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _row_title(row) -> str:
+    """Extract the course title text from a header row."""
+    try:
+        return row.find_element(By.XPATH, ".//p[contains(@class, 'course-name')]").text.strip()
+    except Exception:
+        pass
+    try:
+        return row.find_element(By.XPATH, ".//a").text.strip()
+    except Exception:
+        return ""
+
+
+def _apply_in_progress_filter(driver) -> None:
+    """Apply the '進行中' filter on the My Learning page and wait for the list to render."""
+    # Use structural XPath instead of dynamic ID (Angular reassigns mat-select-N on each load)
+    filter_xpath = "//mat-select[not(ancestor::mat-paginator)]"
+    try:
+        filter_select = WebDriverWait(driver, 8).until(
+            EC.element_to_be_clickable((By.XPATH, filter_xpath))
+        )
+        filter_select.click()
+        try:
+            in_progress_option = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.XPATH, "//mat-option[contains(normalize-space(.),'進行中')]"))
+            )
+            in_progress_option.click()
+            log("[Navigate] 已套用「進行中」篩選。")
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//tr[contains(@class, 'table__accordion-head')]"))
+            )
+            time.sleep(1)
+        except Exception:
+            # Close any open overlay before giving up
+            try:
+                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            except Exception:
+                pass
+            log("[Navigate] 無法選取「進行中」選項，繼續使用全部課程。")
+    except Exception as e:
+        log(f"[Navigate] 找不到篩選器（繼續使用全部課程）：{e}")
+
+
+def _wait_for_course_list(driver) -> None:
+    """Wait for the course list rows and their unpassed buttons to be fully rendered."""
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, "//tr[contains(@class, 'table__accordion-head')]"))
+        )
+    except Exception:
+        pass
+    # Wait for Angular to finish rendering the unpassed status buttons inside each row.
+    # These are in the detail rows and may appear later than the header rows.
+    try:
+        WebDriverWait(driver, 8).until(
+            EC.presence_of_element_located((By.XPATH, "//button[contains(@class, 'ml-table__button--unpassed')]"))
+        )
+    except Exception:
+        pass  # No unpassed courses on this page, or buttons rendered elsewhere
+    time.sleep(1)
+
+
+def _collect_page_titles(driver) -> List[str]:
+    """Return unpassed course titles from the current page."""
+    try:
+        rows = driver.find_elements(By.XPATH, "//tr[contains(@class, 'table__accordion-head')]")
+    except Exception:
+        return []
+    titles = []
+    for row in rows:
+        if _is_row_unpassed(row):
+            t = _row_title(row)
+            if t:
+                titles.append(t)
+    return titles
+
+
+def _find_row_on_current_page(driver, title: str):
+    """Search the current page for a row whose title matches. Returns the row or None."""
+    try:
+        rows = driver.find_elements(By.XPATH, "//tr[contains(@class, 'table__accordion-head')]")
+    except Exception:
+        return None
+    for row in rows:
+        if _is_row_unpassed(row) and _row_title(row) == title:
+            return row
+    return None
+
+
+def _find_row_across_pages(driver, title: str):
+    """Search across all paginator pages for a matching unpassed row. Returns the row or None."""
+    while True:
+        _wait_for_course_list(driver)
+        row = _find_row_on_current_page(driver, title)
+        if row is not None:
+            return row
+        try:
+            next_btn = driver.find_element(By.XPATH,
+                "//button[contains(@class,'mat-paginator-navigation-next')]")
+            if next_btn.get_attribute("disabled"):
+                return None
+            next_btn.click()
+        except Exception:
+            return None
+
+
+def _reload_my_learning(driver) -> None:
+    """Navigate back to My Learning page and re-apply the 進行中 filter.
+
+    If already on the my-learning page, navigate via home first to force Angular
+    to destroy and recreate the component (resetting the paginator to page 1).
+    Navigating to the same hash URL from the same page may be treated as a no-op
+    by the Angular router, leaving the paginator on a non-first page.
+    When coming from a different route (e.g. a course page), a direct navigation
+    is sufficient.
+    """
+    if 'my-learning' in driver.current_url:
+        driver.get('https://moocs.moe.edu.tw/moocs/#/home')
+        time.sleep(1)
+    driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
+    _wait_for_course_list(driver)
+    _apply_in_progress_filter(driver)
+
+
 def open_in_progress_courses_mod(driver: webdriver.Chrome) -> Tuple[List[Tuple[webdriver.Chrome, str]], List[str]]:
     """Navigate to the My Learning page and open all not-yet-passed courses.
 
@@ -864,186 +1004,96 @@ def open_in_progress_courses_mod(driver: webdriver.Chrome) -> Tuple[List[Tuple[w
     """
     wait = WebDriverWait(driver, 20)
 
-    # Click the user avatar to expand the dropdown, then click "我修的課".
-    # The dropdown item is a <button mat-menu-item>, not an <a>, so we use
-    # XPath rather than LINK_TEXT to locate and click it.
     my_courses_xpath = (
         "//button[normalize-space(.)='我修的課'] | //a[normalize-space(.)='我修的課']"
     )
     if click_user_avatar(driver, wait):
         try:
-            my_courses_link = wait.until(
-                EC.element_to_be_clickable((By.XPATH, my_courses_xpath))
-            )
+            my_courses_link = wait.until(EC.element_to_be_clickable((By.XPATH, my_courses_xpath)))
             my_courses_link.click()
         except Exception as e:
             log(f"[Navigate] 找到頭像下拉選單但無法點擊「我修的課」：{e}")
-            # Fallback: direct URL navigation
             driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
     else:
-        # Fallback: navigate directly to the My Learning page URL
         log("[Navigate] 無法點擊頭像展開選單，嘗試直接導向我修的課頁面。")
         driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
 
-    # Wait for the My Learning page to load (Angular SPA may be slow in headless mode)
-    try:
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.XPATH, "//tr[contains(@class, 'table__accordion-head')]"))
-        )
-        log("[Navigate] 課程列表已載入。")
-    except Exception:
-        log("[Navigate] 等待課程列表逾時，繼續執行…")
-    time.sleep(1)  # Extra buffer for Angular rendering
-
-    # Apply the "進行中" filter via the Angular Material mat-select dropdown.
-    # The filter select has id="mat-select-0" and currently shows "不限".
-    # After clicking it, options appear in the CDK overlay as <mat-option> elements.
-    try:
-        filter_select = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.ID, "mat-select-0"))
-        )
-        filter_select.click()
-        # Wait for the overlay options to appear
-        in_progress_option = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((
-                By.XPATH,
-                "//mat-option[contains(normalize-space(.),'進行中')]",
-            ))
-        )
-        in_progress_option.click()
-        log("[Navigate] 已套用「進行中」篩選。")
-        # Wait for the filtered list to render
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, "//tr[contains(@class, 'table__accordion-head')]"))
-        )
-        time.sleep(1)
-    except Exception as e:
-        log(f"[Navigate] 無法套用篩選（繼續使用全部課程）：{e}")
+    _wait_for_course_list(driver)
+    log("[Navigate] 課程列表已載入。")
+    _apply_in_progress_filter(driver)
 
     parent_handle = driver.current_window_handle
-    # We'll return a list of (driver, handle) pairs.  If child_headless is False,
-    # the driver will always be the main driver; otherwise a new headless driver
-    # will be spawned for each course and added here.
     course_windows: List[Tuple[webdriver.Chrome, str]] = []
     course_ids: List[str] = []
-    seen_ids = set()
-    # Log course titles for debugging
-    titles = []
-    try:
-        header_rows = driver.find_elements(By.XPATH, "//tr[contains(@class, 'table__accordion-head')]")
-    except Exception:
-        header_rows = []
-    log(f"[Navigate] 找到 {len(header_rows)} 個課程表頭列。")
-    for row in header_rows:
-        # Determine if this row represents an in‑progress course
-        unpassed = False
+    seen_ids: set = set()
+    titles: List[str] = []
+
+    # Pass 1: collect all unpassed course titles across all pages
+    seen_titles: set = set()
+    page_num = 1
+    while True:
+        _wait_for_course_list(driver)
+        page_titles = _collect_page_titles(driver)
+        new_titles = [t for t in page_titles if t not in seen_titles]
+        seen_titles.update(new_titles)
+        titles.extend(new_titles)
+        log(f"[Navigate] 第 {page_num} 頁找到 {len(page_titles)} 筆，新增 {len(new_titles)} 筆未完成課程。")
         try:
-            if row.find_elements(By.XPATH, ".//button[contains(@class, 'ml-table__button--unpassed')]"):
-                unpassed = True
+            next_btn = driver.find_element(By.XPATH,
+                "//button[contains(@class,'mat-paginator-navigation-next')]")
+            if next_btn.get_attribute("disabled"):
+                break
+            next_btn.click()
+            page_num += 1
         except Exception:
-            pass
-        if not unpassed:
-            try:
-                detail_row = row.find_element(By.XPATH, "following-sibling::tr[1]")
-                if detail_row.find_elements(By.XPATH, ".//button[contains(@class, 'ml-table__button--unpassed')]"):
-                    unpassed = True
-            except Exception:
-                pass
-        if not unpassed:
-            continue
-        try:
-            title_elem = row.find_element(By.XPATH, ".//p[contains(@class, 'course-name')]")
-            t = title_elem.text.strip()
-            if t:
-                titles.append(t)
-        except Exception:
-            try:
-                title_elem_alt = row.find_element(By.XPATH, ".//a")
-                t = title_elem_alt.text.strip()
-                if t:
-                    titles.append(t)
-            except Exception:
-                pass
-    if titles:
-        log(f"[Navigate] 課程列表：{titles}")
-    # Iterate through each course title that we detected as unpassed and open its page sequentially.
-    # Get cookies from the main driver so they can be reused in child drivers.
+            break
+
+    log(f"[Navigate] 共收集 {len(titles)} 筆未完成課程：{titles}")
+
+    # Pass 2a: collect all course URLs (filter applied once; use driver.back() between clicks)
+    _reload_my_learning(driver)
+    course_url_map: List[Tuple[str, str, str]] = []  # (title, course_id, course_url)
     for title in titles:
         if not title:
             continue
-        # Iterate over all header rows to find the one whose title matches exactly
-        matching_row = None
-        try:
-            current_rows = driver.find_elements(By.XPATH, "//tr[contains(@class, 'table__accordion-head')]")
-        except Exception:
-            current_rows = []
-        for row in current_rows:
-            # Check if the row (or its detail row) has the unpassed button
-            unpassed = False
-            try:
-                if row.find_elements(By.XPATH, ".//button[contains(@class, 'ml-table__button--unpassed')]"):
-                    unpassed = True
-            except Exception:
-                pass
-            if not unpassed:
-                try:
-                    drow = row.find_element(By.XPATH, "following-sibling::tr[1]")
-                    if drow.find_elements(By.XPATH, ".//button[contains(@class, 'ml-table__button--unpassed')]"):
-                        unpassed = True
-                except Exception:
-                    pass
-            if not unpassed:
-                continue
-            # Retrieve the title text
-            try:
-                t_elem = row.find_element(By.XPATH, ".//p[contains(@class, 'course-name')]")
-                t_text = t_elem.text.strip()
-            except Exception:
-                try:
-                    t_elem = row.find_element(By.XPATH, ".//a")
-                    t_text = t_elem.text.strip()
-                except Exception:
-                    continue
-            if t_text == title:
-                matching_row = row
-                break
+        matching_row = _find_row_across_pages(driver, title)
         if matching_row is None:
+            log(f"[Navigate] 找不到課程「{title}」，略過。")
+            # Navigate to page 1 without filter so next search can proceed
+            driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
+            _wait_for_course_list(driver)
             continue
-        # Click the course title element in the matching row
         try:
-            # Prefer <p class="course-name"> element
             try:
                 click_elem = matching_row.find_element(By.XPATH, ".//p[contains(@class, 'course-name')]")
             except Exception:
                 click_elem = matching_row.find_element(By.XPATH, ".//a")
             click_elem.click()
         except Exception:
+            driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
+            _wait_for_course_list(driver)
             continue
-        # Wait until the URL indicates the course page
         try:
             WebDriverWait(driver, 15).until(lambda d: "/learning/" in d.current_url)
         except Exception:
-            # If navigation fails, reload the list and move to the next title
-            try:
-                driver.switch_to.window(parent_handle)
-                driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
-                time.sleep(3)
-            except Exception:
-                pass
+            driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
+            _wait_for_course_list(driver)
             continue
         course_url = driver.current_url
         m = re.search(r"(\d+)$", course_url)
         course_id = m.group(1) if m else course_url
-        if course_id in seen_ids:
-            try:
-                driver.switch_to.window(parent_handle)
-                driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
-                time.sleep(3)
-            except Exception:
-                pass
-            continue
-        seen_ids.add(course_id)
-        course_ids.append(course_id)
+        if course_id not in seen_ids:
+            seen_ids.add(course_id)
+            course_url_map.append((title, course_id, course_url))
+        # Go back to my-learning via browser history — Angular resets to page 1.
+        # No filter re-application needed: _find_row_across_pages searches all pages.
+        driver.back()
+        _wait_for_course_list(driver)
+
+    log(f"[Navigate] 共確認 {len(course_url_map)} 筆課程 URL，開始開啟分頁…")
+
+    # Pass 2b: open all collected course URLs in new tabs at once
+    for title, course_id, course_url in course_url_map:
         try:
             driver.switch_to.new_window('window')
             driver.get(course_url)
@@ -1053,13 +1103,10 @@ def open_in_progress_courses_mod(driver: webdriver.Chrome) -> Tuple[List[Tuple[w
             n_handle = driver.window_handles[-1]
             driver.switch_to.window(n_handle)
         course_windows.append((driver, n_handle))
+        course_ids.append(course_id)
         log(f"[Navigate] 已開啟課程視窗 {n_handle}，課程 ID {course_id}（{title}）。")
-        try:
-            driver.switch_to.window(parent_handle)
-            driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
-            time.sleep(3)
-        except Exception:
-            time.sleep(3)
+        driver.switch_to.window(parent_handle)
+
     if not course_windows:
         log("[Navigate] 沒有找到標示為未完成的課程。")
     return course_windows, course_ids
@@ -1171,47 +1218,78 @@ def main() -> None:
 
     log("[Main] 登入確認成功。")
 
-    course_pairs, course_ids = open_in_progress_courses_mod(driver)
-    if not course_pairs:
-        log("[Main] 沒有找到未完成課程，或是打開課程時發生錯誤。請確認您已登入且有未完成課程。")
-        return
+    # Capture the initial window handle so we can close course tabs between
+    # cycles while keeping the main (navigation) tab alive.
+    main_handle = driver.current_window_handle
 
-    # Build triples (driver, handle, course_id) for the monitoring loop.
-    # Zipping course_pairs with course_ids is safe because
-    # open_in_progress_courses_mod appends to both lists in lock-step.
-    triples: List[Tuple[webdriver.Chrome, str, str]] = [
-        (drv, hdl, cid) for (drv, hdl), cid in zip(course_pairs, course_ids)
-    ]
+    # Every CYCLE_MINUTES we close all course tabs and reopen them, to avoid
+    # the platform's 30-minute progress-reset mechanism.
+    CYCLE_MINUTES = 25
 
-    # Collect all driver instances so the finally block can quit them all.
-    drivers_to_close: set = {driver}
-    drivers_to_close.update(drv for drv, _, _ in triples)
-
-    # A single sequential monitoring loop prevents race conditions when
-    # multiple courses share the same driver instance.
     stop_event = threading.Event()
-    monitor_thread = threading.Thread(
-        target=run_click_loop,
-        args=(triples, 30, stop_event),
-        daemon=False,
-    )
-    monitor_thread.start()
-    log(f"[Main] 已開始監控 {len(triples)} 門課程（順序為找到的順序）：{course_ids}")
-    log("[Main] 按 Ctrl+C 可中止。")
+    monitor_thread: "threading.Thread | None" = None
+
     try:
-        monitor_thread.join()
-        log("[Main] 所有課程已完成，程式結束。")
-    except KeyboardInterrupt:
-        log("[Main] 接收到中斷訊號，通知監控執行緒停止…")
-        stop_event.set()
-        monitor_thread.join(timeout=10)
-    finally:
-        # Close all drivers (main and child) gracefully
-        for drv in drivers_to_close:
+        while True:
+            course_pairs, course_ids = open_in_progress_courses_mod(driver)
+            if not course_pairs:
+                log("[Main] 沒有找到未完成課程，所有課程已完成或無法開啟。")
+                break
+
+            # Build triples (driver, handle, course_id) for the monitoring loop.
+            triples: List[Tuple[webdriver.Chrome, str, str]] = [
+                (drv, hdl, cid) for (drv, hdl), cid in zip(course_pairs, course_ids)
+            ]
+
+            stop_event = threading.Event()
+            monitor_thread = threading.Thread(
+                target=run_click_loop,
+                args=(triples, 30, stop_event),
+                daemon=False,
+            )
+            monitor_thread.start()
+            log(f"[Main] 已開始監控 {len(triples)} 門課程（順序為找到的順序）：{course_ids}")
+            log(f"[Main] 將在 {CYCLE_MINUTES} 分鐘後自動重開課程頁面以避免進度重置。按 Ctrl+C 可中止。")
+
+            # Block until all courses complete OR the cycle timer expires.
+            monitor_thread.join(timeout=CYCLE_MINUTES * 60)
+
+            if not monitor_thread.is_alive():
+                # Monitoring loop exited naturally: all courses done.
+                log("[Main] 所有課程已完成，程式結束。")
+                break
+
+            # Cycle timer expired: stop the monitor, close course tabs, then reopen.
+            log(f"[Main] 已達 {CYCLE_MINUTES} 分鐘，重新整理課程頁面以避免進度重置…")
+            stop_event.set()
+            monitor_thread.join(timeout=15)
+
+            # Close every tab except the main navigation tab.
+            for handle in list(driver.window_handles):
+                if handle != main_handle:
+                    try:
+                        driver.switch_to.window(handle)
+                        driver.close()
+                    except Exception:
+                        pass
             try:
-                drv.quit()
+                driver.switch_to.window(main_handle)
             except Exception:
                 pass
+            log("[Main] 課程分頁已關閉，重新開啟未完成課程…")
+            # Loop continues: open_in_progress_courses_mod will re-open only
+            # courses that are still "進行中" (completed ones won't appear).
+
+    except KeyboardInterrupt:
+        log("[Main] 接收到中斷訊號，通知監控執行緒停止…")
+        if monitor_thread is not None and monitor_thread.is_alive():
+            stop_event.set()
+            monitor_thread.join(timeout=10)
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

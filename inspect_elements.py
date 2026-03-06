@@ -1,11 +1,9 @@
 """
 inspect_elements.py
 ===================
-登入 MOOC 平台後，抓取以下元素的 HTML 供分析：
-1. CAPTCHA 區域（換一張按鈕）
-2. 我修的課頁面的篩選下拉選單
+登入 MOOC 平台後，抓取「我修的課」頁面的分頁元件 HTML 供分析。
 """
-import json, os, sys, time
+import getpass, os, sys, time
 import mooc_auto
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -14,11 +12,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 os.makedirs("debug", exist_ok=True)
 
-config = mooc_auto.load_config()
-username = config.get('username', '')
-password = config.get('password', '')
-login_method = config.get('login_method', '教育雲端')
-
+# ── 啟動 headless Chrome ──────────────────────────────────────────────────────
 options = webdriver.ChromeOptions()
 options.add_argument('--headless=new')
 options.add_argument('--window-size=1920,1080')
@@ -33,62 +27,28 @@ driver.get('https://moocs.moe.edu.tw/moocs/#/home')
 mooc_auto.ensure_chinese_language(driver)
 time.sleep(5)
 
+# ── 登入 ──────────────────────────────────────────────────────────────────────
+username = input("帳號：").strip()
+password = getpass.getpass("密碼：")
 wait = WebDriverWait(driver, 10)
-mooc_auto.start_login(driver, wait, method=login_method)
+mooc_auto.start_login(driver, wait, method="教育雲端")
+mooc_auto.auto_fill_oauth_form(driver, wait, username, password)
 
-if username and password:
-    mooc_auto.auto_fill_oauth_form(driver, wait, username, password)
-
-# ── 截圖 + 抓 CAPTCHA 區域 HTML ──────────────────────────────────────────────
-time.sleep(1)
-driver.save_screenshot("debug/inspect_captcha.png")
-
-# 抓 CAPTCHA 附近的完整 HTML（包含換一張按鈕）
-captcha_html_parts = []
-for by, sel in [
-    (By.XPATH, "//*[contains(translate(@src,'CAPTCHA','captcha'),'captcha') or contains(translate(@src,'CAPTCHA','captcha'),'CheckCode') or contains(translate(@src,'CAPTCHA','captcha'),'validcode') or contains(translate(@src,'CAPTCHA','captcha'),'verify')]"),
-    (By.XPATH, "//img[contains(@src,'captcha') or contains(@src,'CheckCode') or contains(@src,'validcode')]"),
-]:
-    try:
-        elems = driver.find_elements(by, sel)
-        for el in elems:
-            # Walk up to a container that likely holds both the image and the refresh button
-            for _ in range(5):
-                html = el.get_attribute('outerHTML')
-                parent_html = el.find_element(By.XPATH, '..').get_attribute('outerHTML')
-                captcha_html_parts.append(f"<!-- captcha img ancestor -->\n{parent_html[:4000]}")
-                el = el.find_element(By.XPATH, '..')
-    except Exception:
-        pass
-
-# Also dump the full form area
-try:
-    forms = driver.find_elements(By.TAG_NAME, 'form')
-    for i, f in enumerate(forms):
-        captcha_html_parts.append(f"<!-- form[{i}] -->\n{f.get_attribute('outerHTML')[:6000]}")
-except Exception:
-    pass
-
-with open("debug/inspect_captcha_area.html", "w", encoding="utf-8") as f:
-    f.write("\n\n".join(captcha_html_parts) if captcha_html_parts else "<!-- nothing found -->")
-print(f"[Inspect] CAPTCHA 區域 HTML 已儲存 ({len(captcha_html_parts)} 段)")
-
-# Extract captcha to show user
 captcha_value = mooc_auto.extract_captcha_and_prompt(driver)
 if captcha_value:
     mooc_auto.fill_captcha_and_submit(driver, captcha_value)
-    print("[Inspect] 已送出登入表單，等待導回…")
+    print("[Inspect] 已送出登入，等待導回…")
     time.sleep(8)
 
 if not mooc_auto.verify_login(driver, WebDriverWait(driver, 10)):
-    print("[Inspect] 登入失敗，無法繼續抓取課程頁元素。")
+    print("[Inspect] 登入失敗。")
     driver.save_screenshot("debug/inspect_login_fail.png")
     driver.quit()
     sys.exit(1)
 
 print("[Inspect] 登入成功，前往我修的課…")
 
-# ── 前往我修的課，抓篩選器 HTML ───────────────────────────────────────────────
+# ── 階段 1：UI 導航進入（模擬 Pass 1）────────────────────────────────────────
 wait2 = WebDriverWait(driver, 15)
 mooc_auto.click_user_avatar(driver, wait2)
 try:
@@ -98,32 +58,41 @@ try:
 except Exception:
     driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
 
-time.sleep(5)
-driver.save_screenshot("debug/inspect_my_learning.png")
+mooc_auto._wait_for_course_list(driver)
+mooc_auto._apply_in_progress_filter(driver)
 
-# 抓篩選下拉選單相關 HTML
-filter_parts = []
-for by, sel in [
-    (By.XPATH, "//*[contains(@class,'select') or contains(@class,'filter') or contains(@class,'dropdown')]"),
-    (By.TAG_NAME, "select"),
-    (By.TAG_NAME, "mat-select"),
-    (By.XPATH, "//mat-form-field"),
-]:
-    try:
-        elems = driver.find_elements(by, sel)
-        for el in elems[:5]:
-            filter_parts.append(f"<!-- {sel} -->\n{el.get_attribute('outerHTML')[:3000]}")
-    except Exception:
-        pass
+driver.save_screenshot("debug/inspect_phase1.png")
+rows1 = driver.find_elements(By.XPATH, "//tr[contains(@class,'table__accordion-head')]")
+unpassed_btns1 = driver.find_elements(By.XPATH, "//button[contains(@class,'ml-table__button--unpassed')]")
+print(f"[Phase1] header rows: {len(rows1)}, unpassed buttons: {len(unpassed_btns1)}")
+for i, r in enumerate(rows1[:3]):
+    print(f"  row[{i}] unpassed={mooc_auto._is_row_unpassed(r)}, title={mooc_auto._row_title(r)!r}")
 
-with open("debug/inspect_filter.html", "w", encoding="utf-8") as f:
-    f.write("\n\n".join(filter_parts) if filter_parts else "<!-- nothing found -->")
-print(f"[Inspect] 篩選器 HTML 已儲存 ({len(filter_parts)} 段)")
+# ── 階段 2：driver.get() 重新載入（模擬 _reload_my_learning）────────────────
+print("\n[Inspect] 模擬 _reload_my_learning...")
+driver.get('https://moocs.moe.edu.tw/moocs/#/course/my-learning')
+mooc_auto._wait_for_course_list(driver)
+mooc_auto._apply_in_progress_filter(driver)
 
-# 也存整頁 HTML
-with open("debug/inspect_my_learning_full.html", "w", encoding="utf-8") as f:
+driver.save_screenshot("debug/inspect_phase2.png")
+rows2 = driver.find_elements(By.XPATH, "//tr[contains(@class,'table__accordion-head')]")
+unpassed_btns2 = driver.find_elements(By.XPATH, "//button[contains(@class,'ml-table__button--unpassed')]")
+print(f"[Phase2] header rows: {len(rows2)}, unpassed buttons: {len(unpassed_btns2)}")
+for i, r in enumerate(rows2[:3]):
+    print(f"  row[{i}] unpassed={mooc_auto._is_row_unpassed(r)}, title={mooc_auto._row_title(r)!r}")
+
+# 存整頁 HTML 供比對
+with open("debug/inspect_phase2_full.html", "w", encoding="utf-8") as f:
     f.write(driver.page_source)
-print("[Inspect] 完整頁面 HTML 已儲存至 debug/inspect_my_learning_full.html")
+print("[Inspect] Phase2 完整 HTML → debug/inspect_phase2_full.html")
+
+# ── 抓 detail row（accordion 展開內容）HTML ───────────────────────────────────
+detail_rows = driver.find_elements(By.XPATH, "//tr[contains(@class,'table__accordion-head')]/following-sibling::tr[1]")
+print(f"[Inspect] detail rows in DOM: {len(detail_rows)}")
+if detail_rows:
+    with open("debug/inspect_detail_row.html", "w", encoding="utf-8") as f:
+        f.write(detail_rows[0].get_attribute('outerHTML') or '')
+    print("[Inspect] 第一個 detail row HTML → debug/inspect_detail_row.html")
 
 driver.quit()
 print("[Inspect] 完成。")
